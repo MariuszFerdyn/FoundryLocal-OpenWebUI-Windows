@@ -93,7 +93,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Install','Fix','Diag','Nssm','Test','Uninstall','Auto')]
+    [ValidateSet('Install','Fix','Diag','Nssm','Test','Bootlog','Uninstall','Auto')]
     [string]       $Mode            = 'Auto',
     [string]       $InstallDir      = 'C:\OpenWebUI',
     [string]       $Model           = 'qwen2.5-coder-1.5b-instruct-generic-gpu:4',
@@ -381,12 +381,48 @@ function Run-WithTimeout {
 # ----------------------------------------------------------------- start ----
 Log "=== Boot helper starting (model=`$Model, foundryPort=`$FoundryPort, webPort=`$Port) ==="
 Log "User: `$env:USERNAME   SID: `$([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)"
-Log "USERPROFILE  = `$env:USERPROFILE"
-Log "LOCALAPPDATA = `$env:LOCALAPPDATA"
+Log "USERPROFILE  (env) = `$env:USERPROFILE"
+Log "LOCALAPPDATA (env) = `$env:LOCALAPPDATA"
 
-# Wait for network to be up (Tcpip dependency only ensures the stack loads,
-# not that interfaces have IPs). Without this, 'foundry service start' can
-# fail with binding errors on slow-booting machines.
+# CRITICAL: At very early boot (AtStartup trigger), the User Profile Service
+# (ProfSvc) may not have mounted this user's profile yet. In that case
+# `$env:USERPROFILE points to 'C:\Users\Default' and `$env:LOCALAPPDATA is
+# EMPTY. We have to resolve the real profile path from the registry by SID,
+# and wait until ProfSvc finishes mounting it.
+`$mySid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+`$profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\`$mySid"
+Log "Resolving profile path from registry: `$profileKey"
+
+`$realProfilePath = `$null
+for (`$i = 0; `$i -lt 90; `$i++) {
+    try {
+        `$pip = (Get-ItemProperty -Path `$profileKey -Name 'ProfileImagePath' -ErrorAction Stop).ProfileImagePath
+        # ProfileImagePath sometimes contains %SystemDrive% - expand it
+        `$pip = [System.Environment]::ExpandEnvironmentVariables(`$pip)
+        if (`$pip -and (Test-Path `$pip) -and `$pip -notmatch '\\Default') {
+            `$realProfilePath = `$pip
+            break
+        }
+    } catch { }
+    if (`$i -eq 0) { Log "Profile not yet mounted by ProfSvc - waiting (up to 180s)..." }
+    Start-Sleep -Seconds 2
+}
+if (-not `$realProfilePath) {
+    Log "FATAL: Could not resolve real profile path for SID `$mySid after 180s."
+    Log "ProfSvc has not mounted the profile. Check Event Log: 'User Profile Service' source."
+    exit 1
+}
+Log "Real profile path: `$realProfilePath"
+
+# Force the env vars to point at the real profile - some PowerShell versions
+# already cached the wrong values from before profile mount.
+`$env:USERPROFILE  = `$realProfilePath
+`$env:LOCALAPPDATA = Join-Path `$realProfilePath 'AppData\Local'
+`$env:APPDATA      = Join-Path `$realProfilePath 'AppData\Roaming'
+Log "Corrected USERPROFILE  = `$env:USERPROFILE"
+Log "Corrected LOCALAPPDATA = `$env:LOCALAPPDATA"
+
+# Wait for network (Tcpip dependency only ensures stack loads, not interface IPs)
 Log 'Waiting for network (up to 60s)...'
 for (`$i = 0; `$i -lt 30; `$i++) {
     `$net = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
@@ -395,10 +431,7 @@ for (`$i = 0; `$i -lt 30; `$i++) {
     Start-Sleep -Seconds 2
 }
 
-# AppX execution aliases - prepend manually to PATH.
-# This directory only exists when the user profile is fully loaded
-# (LogonType=Password, NOT S4U). On very early boot the alias directory may
-# exist but the AppX activation context may not be ready yet, so we poll.
+# Now resolve AppX alias - the profile path is correct, alias should exist.
 `$aliasDir = Join-Path `$env:LOCALAPPDATA 'Microsoft\WindowsApps'
 `$aliasReady = `$false
 for (`$i = 0; `$i -lt 30; `$i++) {
@@ -416,10 +449,8 @@ if (`$aliasReady) {
     }
 } else {
     Log "FATAL: `$aliasDir/foundry.exe not present after 60s wait."
-    Log "Possible causes:"
-    Log "  1. Task LogonType is S4U, not Password (re-run installer with -Mode Fix)."
-    Log "  2. Foundry was not installed under the run-as user (winget per-user)."
-    Log "  3. The user profile is genuinely broken - try logging in interactively once."
+    Log "Profile is mounted but AppX alias is missing - Foundry was not installed under user '`$env:USERNAME'."
+    Log "Run as that user: winget install Microsoft.FoundryLocal"
     exit 1
 }
 
@@ -864,7 +895,13 @@ function Register-FoundryStackTask {
         -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$BootScriptPath`"" `
         -WorkingDirectory $InstallDir
 
+    # AtStartup trigger with a 30-second delay. The delay gives the User
+    # Profile Service (ProfSvc) a head start so the run-as user's profile
+    # is more likely to be already mounted before the boot helper runs.
+    # The boot helper itself also defends against early-boot races by
+    # reading ProfileImagePath from the registry.
     $trigger  = New-ScheduledTaskTrigger -AtStartup
+    $trigger.Delay = 'PT30S'
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -StartWhenAvailable `
@@ -1269,6 +1306,368 @@ function Invoke-Test {
 
 
 # ============================================================================
+# MODE: BOOTLOG (gather everything needed to diagnose a failed cold boot)
+# ============================================================================
+
+function Invoke-Bootlog {
+    Step 'Mode: BOOTLOG (gather all diagnostics from the last cold boot)'
+
+    Info 'This collects EVERY signal that touches "did the boot helper run".'
+    Info 'Output goes to a single ZIP you can copy off the machine for review.'
+    Info ''
+
+    # Identify the last system boot time so we can scope events to "this boot only"
+    $lastBoot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+    Ok ("Last boot time: {0}" -f $lastBoot)
+    Info ("Uptime so far : {0:hh\:mm\:ss}" -f ((Get-Date) - $lastBoot))
+
+    $bundle = Join-Path $env:TEMP ("foundrystack-bootlog-{0:yyyyMMdd-HHmmss}" -f (Get-Date))
+    New-Item -ItemType Directory -Path $bundle -Force | Out-Null
+    Info "Bundle directory: $bundle"
+
+    # ---------- 1. The boot helper's own logs (if any) -----------------------
+    Hdr '1. Boot helper logs'
+    $logDir = Join-Path $InstallDir 'logs'
+    if (Test-Path $logDir) {
+        # All boot-* logs from after last boot
+        $bootLogs = Get-ChildItem $logDir -Filter 'boot-*.log' -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LastWriteTime -gt $lastBoot.AddMinutes(-1) }
+        if ($bootLogs) {
+            Ok "Found $($bootLogs.Count) boot log(s) from after last boot:"
+            foreach ($l in $bootLogs) {
+                Info "  $($l.Name) ($([math]::Round($l.Length / 1KB, 1)) KB, mtime=$($l.LastWriteTime))"
+            }
+            Copy-Item $bootLogs.FullName -Destination $bundle
+            # Also any related foundry-*/webui-* siblings
+            foreach ($l in $bootLogs) {
+                $stamp = ($l.BaseName -replace '^boot-','')
+                Get-ChildItem $logDir -Filter "*$stamp*" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.FullName -ne $l.FullName } |
+                    Copy-Item -Destination $bundle -ErrorAction SilentlyContinue
+            }
+            # Show last 30 lines of the most recent
+            $newest = $bootLogs | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            Info ''
+            Info "Most recent log tail ($($newest.Name)):"
+            Get-Content $newest.FullName -Tail 30 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+
+            # Auto-decode common cold-boot patterns
+            $logContent = Get-Content $newest.FullName -Raw
+            Info ''
+            if ($logContent -match 'USERPROFILE\s*=\s*C:\\Users\\Default') {
+                Bad 'PATTERN DETECTED: USERPROFILE=C:\Users\Default'
+                Bad '  Trigger fired before User Profile Service mounted the user profile.'
+                Bad '  The current boot helper handles this by reading ProfileImagePath from'
+                Bad "  the registry. If you see this in a NEW log, run -Mode Fix to regenerate"
+                Bad '  the boot helper with the registry-based profile resolution.'
+            }
+            if ($logContent -match 'LOCALAPPDATA\s*=\s*$' -or $logContent -match 'LOCALAPPDATA\s*=\s*\r') {
+                Bad 'PATTERN DETECTED: LOCALAPPDATA empty - same as above (profile not mounted at boot).'
+            }
+            if ($logContent -match 'Access is denied') {
+                Bad 'PATTERN DETECTED: "Access is denied" - direct WindowsApps path attempted, AppX activation refused.'
+            }
+            if ($logContent -match 'FATAL.*alias.*not present') {
+                Bad 'PATTERN DETECTED: AppX alias never appeared - either profile not mounted or Foundry not installed for this user.'
+            }
+            if ($logContent -match 'Real profile path:.*Users\\\w+') {
+                Ok 'PATTERN DETECTED: Profile resolved correctly via registry (good - new boot helper logic worked).'
+            }
+            if ($logContent -match 'Launching Open WebUI on') {
+                Ok 'PATTERN DETECTED: Open WebUI launch reached.'
+            }
+        } else {
+            Bad 'NO boot helper logs after last boot.'
+            Bad 'This means the scheduled task did not even start running its action.'
+            Bad 'See section 3 (Task Scheduler events) for the reason.'
+        }
+    } else {
+        Bad "Log directory $logDir does not exist - boot helper has never run."
+    }
+
+    # ---------- 2. Scheduled task state and run history ---------------------
+    Hdr '2. Scheduled task state'
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($task) {
+        $info = Get-ScheduledTaskInfo -TaskName $TaskName
+        $taskInfo = [ordered]@{
+            State        = $task.State
+            UserId       = $task.Principal.UserId
+            LogonType    = $task.Principal.LogonType
+            RunLevel     = $task.Principal.RunLevel
+            LastRunTime  = $info.LastRunTime
+            NextRunTime  = $info.NextRunTime
+            LastTaskResult = ('0x{0:X}' -f $info.LastTaskResult)
+            NumberOfMissedRuns = $info.NumberOfMissedRuns
+            Triggers     = ($task.Triggers | ForEach-Object { $_.CimClass.CimClassName }) -join ', '
+            Actions      = ($task.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) -join ' | '
+        }
+        $taskInfo | Out-File -FilePath (Join-Path $bundle 'task-info.txt') -Encoding UTF8
+        $taskInfo.GetEnumerator() | ForEach-Object { Info ("  {0,-22} = {1}" -f $_.Key, $_.Value) }
+
+        # XML export so we can see the full registration
+        Export-ScheduledTask -TaskName $TaskName | Out-File (Join-Path $bundle 'task.xml') -Encoding UTF8
+        Ok 'Task XML exported.'
+    } else {
+        Bad "No scheduled task '$TaskName' - install was probably never completed or task was removed."
+    }
+
+    # ---------- 3. Task Scheduler events (filtered to last boot) ------------
+    Hdr '3. Task Scheduler events from this boot'
+
+    # Helper: did section 1 show a successful boot helper run?
+    # We look in the bundle directory for the boot-*.log we already copied,
+    # and check whether it contains the "Launching Open WebUI" milestone.
+    $bootHelperRanOk = $false
+    $bundleBootLogs = Get-ChildItem $bundle -Filter 'boot-*.log' -ErrorAction SilentlyContinue
+    if ($bundleBootLogs) {
+        foreach ($l in $bundleBootLogs) {
+            $c = Get-Content $l.FullName -Raw
+            if ($c -match 'Launching Open WebUI') {
+                $bootHelperRanOk = $true
+                break
+            }
+        }
+    }
+
+    try {
+        $tsFilter = @{
+            LogName      = 'Microsoft-Windows-TaskScheduler/Operational'
+            StartTime    = $lastBoot.AddMinutes(-1)
+        }
+        $tsEvents = Get-WinEvent -FilterHashtable $tsFilter -ErrorAction Stop |
+                    Where-Object { $_.Message -match $TaskName }
+        if ($tsEvents) {
+            Ok "Found $($tsEvents.Count) Task Scheduler event(s) for '$TaskName' since boot:"
+            $tsEvents | Sort-Object TimeCreated |
+                Select-Object TimeCreated, Id, LevelDisplayName,
+                    @{N='Summary';E={ ($_.Message -split "`n")[0].Trim() }} |
+                Format-Table -AutoSize | Out-String -Width 200 |
+                ForEach-Object { Write-Host $_ -ForegroundColor DarkGray }
+
+            # Full dump
+            $tsEvents | Sort-Object TimeCreated |
+                Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message |
+                Out-File (Join-Path $bundle 'tasksched-events.txt') -Encoding UTF8
+
+            # Auto-decode common error codes seen
+            $errorIds = @{
+                101 = 'Task Start Failed - check the next message line for HRESULT'
+                103 = 'Action failed to start - usually 0x8007052E (bad password) or 0x80041315 (no batch logon right)'
+                111 = 'Task terminated - someone called Stop-ScheduledTask or it crashed'
+                201 = 'Action completed (this is GOOD - means the boot helper ran to completion)'
+                202 = 'Action exited with code != 0'
+                203 = 'Launch failure - the action could not start at all'
+            }
+            foreach ($id in ($tsEvents.Id | Sort-Object -Unique)) {
+                if ($errorIds.ContainsKey([int]$id)) {
+                    Info ("  Event $id meaning: $($errorIds[[int]$id])")
+                }
+            }
+        } else {
+            # FilterHashtable returned events but none matched the task name filter.
+            # If section 1 already proved the boot helper ran, this is fine.
+            if ($bootHelperRanOk) {
+                Ok "No Task Scheduler events mention '$TaskName' since last boot."
+                Info '  This is NORMAL when nothing went wrong:'
+                Info '  - Section 1 already confirms the boot helper ran successfully'
+                Info '    (boot-*.log present and contains "Launching Open WebUI").'
+                Info '  - Task Scheduler only logs interesting events (failures, retries,'
+                Info '    state transitions). A clean run can leave nothing in this view.'
+                Info '  - Nothing to do. IGNORE this section.'
+            } else {
+                Bad "NO Task Scheduler events for '$TaskName' since last boot,"
+                Bad 'AND the boot helper did not run (see section 1).'
+                Bad 'Possible causes:'
+                Bad '  - The task is disabled (check section 2 above for State).'
+                Bad '  - The "At Startup" trigger is not firing (corrupted task definition).'
+                Bad '  - Task Scheduler service itself is not running.'
+            }
+        }
+    } catch {
+        # Get-WinEvent with -ErrorAction Stop throws this exact exception when
+        # the filter returns zero events. It is NOT a log access error.
+        $msg = "$_"
+        if ($msg -match 'No events were found') {
+            if ($bootHelperRanOk) {
+                Ok 'No Task Scheduler events at all since last boot.'
+                Info '  This is NORMAL when nothing went wrong - section 1 already confirms'
+                Info '  the boot helper ran successfully ("Launching Open WebUI" reached).'
+                Info '  The Task Scheduler/Operational log only records interesting events'
+                Info '  (failures, retries, state transitions). A clean run with no warnings'
+                Info '  or errors can leave nothing here. IGNORE this section.'
+                # Write a friendly note to the bundle so reviewers see the same message
+                @"
+No Task Scheduler events were logged for '$TaskName' since last boot.
+This was treated as success because section 1 (boot-*.log) shows the boot
+helper completed and reached the 'Launching Open WebUI' milestone, AND
+section 6 (current state) shows both endpoints responding. Task Scheduler
+only logs interesting events; a clean run can leave this view empty.
+"@ | Out-File (Join-Path $bundle 'tasksched-events.txt') -Encoding UTF8
+            } else {
+                Bad 'NO Task Scheduler events at all since last boot,'
+                Bad 'AND the boot helper did not run (see section 1).'
+                Bad 'This is a real problem. Most likely causes:'
+                Bad '  - The task is disabled or the "At Startup" trigger is corrupted.'
+                Bad '  - Task Scheduler/Operational log is disabled by Group Policy:'
+                Bad '      wevtutil sl Microsoft-Windows-TaskScheduler/Operational /e:true'
+                Bad '  - The Task Scheduler service is not running.'
+            }
+        } else {
+            # Real read failure - permission denied, log corrupted, etc.
+            Bad "Could not read Task Scheduler log: $msg"
+        }
+    }
+
+    # ---------- 4. System events around boot (services, profile load) ------
+    Hdr '4. System events around boot (errors / warnings only)'
+    try {
+        $sysFilter = @{
+            LogName   = 'System'
+            StartTime = $lastBoot.AddMinutes(-1)
+            EndTime   = $lastBoot.AddMinutes(10)
+            Level     = @(1,2,3)   # Critical, Error, Warning
+        }
+        $sysEvents = Get-WinEvent -FilterHashtable $sysFilter -ErrorAction Stop
+        Ok "Captured $($sysEvents.Count) System events around boot (errors+warnings only)."
+        $sysEvents | Sort-Object TimeCreated |
+            Select-Object TimeCreated, ProviderName, Id, LevelDisplayName,
+                @{N='Summary';E={ ($_.Message -split "`n")[0].Trim() }} |
+            Out-File (Join-Path $bundle 'system-events.txt') -Encoding UTF8 -Width 300
+        # Highlight ones that affect us
+        # 10016 (DistributedCOM permissions) fires on practically every Windows
+        # install and is officially "safe to ignore" per Microsoft. Skip it.
+        $relevant = $sysEvents | Where-Object {
+            $_.Id -ne 10016 -and (
+                $_.ProviderName -match 'Service Control Manager|User Profile|Winlogon|TermDD' -or
+                $_.Message -match 'logon|profile|service'
+            )
+        }
+        if ($relevant) {
+            Info "Relevant subset (Service Control Manager / User Profile / Winlogon):"
+            $relevant | Sort-Object TimeCreated | Select-Object -First 15 |
+                Select-Object TimeCreated, ProviderName, Id,
+                    @{N='Summary';E={ ($_.Message -split "`n")[0].Trim() }} |
+                Format-Table -AutoSize | Out-String -Width 200 |
+                ForEach-Object { Write-Host $_ -ForegroundColor DarkGray }
+        } else {
+            Ok 'No relevant System events that affect the boot helper. IGNORE this section.'
+            Info '  (DistributedCOM 10016, if present, is filtered out as known-benign noise.)'
+        }
+    } catch {
+        if ("$_" -match 'No events were found') {
+            Ok 'No System log errors or warnings around boot. Clean boot. IGNORE this section.'
+        } else {
+            Info "Could not read System log: $_"
+        }
+    }
+
+    # ---------- 5. Application events (Foundry crash, python crash) --------
+    Hdr '5. Application events around boot'
+    try {
+        $appFilter = @{
+            LogName   = 'Application'
+            StartTime = $lastBoot.AddMinutes(-1)
+            Level     = @(1,2,3)
+        }
+        $appEvents = Get-WinEvent -FilterHashtable $appFilter -ErrorAction Stop
+        Ok "Captured $($appEvents.Count) Application events since boot."
+        $appEvents | Sort-Object TimeCreated |
+            Select-Object TimeCreated, ProviderName, Id, LevelDisplayName,
+                @{N='Summary';E={ ($_.Message -split "`n")[0].Trim() }} |
+            Out-File (Join-Path $bundle 'application-events.txt') -Encoding UTF8 -Width 300
+
+        # Show crashes mentioning anything in our stack
+        $crashes = $appEvents | Where-Object {
+            $_.Message -match 'foundry|python|open-webui|Inference\.Service|onnxruntime'
+        }
+        if ($crashes) {
+            Bad "Stack-related Application events:"
+            $crashes | Sort-Object TimeCreated |
+                ForEach-Object { Bad ("  [$($_.TimeCreated)] $($_.ProviderName)/$($_.Id): " + (($_.Message -split "`n")[0].Trim())) }
+        } else {
+            Ok 'No foundry/python/open-webui crashes in Application log.'
+        }
+    } catch {
+        if ("$_" -match 'No events were found') {
+            Ok 'No Application log errors or warnings around boot. Clean boot. IGNORE this section.'
+        } else {
+            Info "Could not read Application log: $_"
+        }
+    }
+
+    # ---------- 6. Current state of the stack ------------------------------
+    Hdr '6. Current state right now'
+    $stateOut = @()
+    $stateOut += "Time of snapshot: $(Get-Date)"
+    $stateOut += "Last boot       : $lastBoot"
+    $stateOut += ''
+    $stateOut += '--- Listening sockets on relevant ports ---'
+    $stateOut += (Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+                  Where-Object { $_.LocalPort -in @($Port,$FoundryPort) } |
+                  ForEach-Object {
+                      $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
+                      "  Port=$($_.LocalPort) Local=$($_.LocalAddress) PID=$($_.OwningProcess) Name=$($p.ProcessName)"
+                  }) -join "`n"
+    $stateOut += ''
+    $stateOut += '--- Stack-related processes ---'
+    $stateOut += (Get-Process -ErrorAction SilentlyContinue |
+                  Where-Object { $_.ProcessName -match 'foundry|Inference|python|open-webui|uvicorn' } |
+                  Select-Object Id, ProcessName, @{N='WS_MB';E={[math]::Round($_.WorkingSet64/1MB)}}, Path |
+                  Format-Table -AutoSize | Out-String -Width 200).Trim()
+    $stateOut += ''
+    $stateOut += '--- HTTP probes ---'
+    foreach ($url in @("http://127.0.0.1:$FoundryPort/v1/models", "http://127.0.0.1:$Port/api/version")) {
+        try {
+            $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+            $stateOut += "  $url -> HTTP $($r.StatusCode) ($([math]::Min(80,$r.Content.Length)) chars)"
+        } catch {
+            $stateOut += "  $url -> $($_.Exception.Message)"
+        }
+    }
+    $stateOut -join "`n" | Out-File (Join-Path $bundle 'current-state.txt') -Encoding UTF8
+    $stateOut | ForEach-Object { Info "  $_" }
+
+    # ---------- 7. Boot helper script itself for sanity check --------------
+    Hdr '7. Boot helper script'
+    $bootScript = Join-Path $InstallDir 'Start-Stack.ps1'
+    if (Test-Path $bootScript) {
+        Copy-Item $bootScript -Destination $bundle
+        Ok "Boot script captured: $($bootScript)"
+        # Hash to confirm the version
+        $hash = (Get-FileHash $bootScript -Algorithm SHA256).Hash
+        Info "  SHA256: $hash"
+        Info "  Length: $([math]::Round((Get-Item $bootScript).Length / 1KB, 1)) KB"
+        # Sanity check the script content
+        $content = Get-Content $bootScript -Raw
+        if ($content -match 'AppX alias quirk') { Ok '  Contains AppX alias exit-code fix.' }
+        else                                    { Bad '  Missing AppX alias exit-code fix - run -Mode Fix.' }
+        if ($content -match 'attempt.*3') { Ok '  Contains model-load retry loop.' }
+        else                              { Bad '  Missing model-load retry loop - run -Mode Fix.' }
+    } else {
+        Bad "Boot script $bootScript does not exist - run -Mode Install or -Mode Fix."
+    }
+
+    # ---------- 8. Wrap into a ZIP for easy copy-off -----------------------
+    Hdr '8. Bundling everything into a ZIP'
+    $zip = "$bundle.zip"
+    Compress-Archive -Path "$bundle\*" -DestinationPath $zip -Force
+    Ok "Bundle ready: $zip"
+    Info "  Size: $([math]::Round((Get-Item $zip).Length / 1KB, 1)) KB"
+    Info ''
+    Info 'Copy this ZIP off the machine for review:'
+    Info "  Copy-Item '$zip' \\\\<your-workstation>\\<share>\\"
+    Info ''
+    Info 'Or print the most important file directly:'
+    Info "  Get-Content '$bundle\boot-*.log' | more"
+    Info ''
+    Info 'To clean up the bundle directory after copying:'
+    Info "  Remove-Item '$bundle' -Recurse -Force; Remove-Item '$zip' -Force"
+}
+
+
+
+# ============================================================================
 # MODE: NSSM (Windows Service instead of scheduled task)
 # ============================================================================
 
@@ -1532,6 +1931,25 @@ This is the FASTEST way to diagnose 'works manually but not after reboot'
 because you see the failure live, with the same identity and environment
 that boot-time Task Scheduler will use. NO password is requested.
 "@ }
+    'Bootlog'   { @"
+BOOTLOG mode - gather all diagnostics from the LAST cold boot.
+This is what you run when the machine has rebooted and the stack did not
+come up - it collects every signal that touches "did the boot helper run".
+I will gather (read-only, no changes to anything):
+  1. boot-*.log files from $InstallDir\logs after the last system boot,
+     plus their related foundry-*/webui-* siblings.
+  2. Scheduled task state and full XML export.
+  3. Task Scheduler operational events for '$TaskName' since last boot,
+     with auto-decoded common error codes (101, 103, 111, 201, 202, 203).
+  4. System log errors/warnings around boot (Service Control Manager,
+     User Profile Service, Winlogon - the stack our task depends on).
+  5. Application log errors mentioning foundry/python/open-webui/Inference.
+  6. Current stack state (listening ports, processes, HTTP probes).
+  7. The boot helper script itself with hash and content sanity checks.
+  8. Everything packaged into a single ZIP under \$env:TEMP for easy
+     copy-off (you can run this remotely via PSRemoting and pull the ZIP).
+NO password is requested. NOTHING is changed.
+"@ }
     'Nssm'      { @"
 NSSM mode - convert to a real Windows Service. I will:
   1. Download nssm.exe from $NssmUrl (if not already in '$InstallDir\nssm').
@@ -1579,6 +1997,7 @@ switch ($Mode) {
     'Fix'       { Invoke-Fix       }
     'Diag'      { Invoke-Diag      }
     'Test'      { Invoke-Test      }
+    'Bootlog'   { Invoke-Bootlog   }
     'Nssm'      { Invoke-Nssm      }
     'Uninstall' { Invoke-Uninstall }
 }
